@@ -115,7 +115,7 @@ error() {
 prepare() {
     # get aurball
     [[ ! "${AURBALL}" ]] && AURBALL=$(ls *.src.tar.gz 2>/dev/null | head -n1)
-    [[ ! "${AURBALL}" ]] && error "Unable to find aurball"
+    [[ ! -e "${AURBALL}" ]] && error "Unable to find aurball"
     [[ ! -r "${AURBALL}" ]] && error "Unable to get read permission on aurball ${AURBALL}"
 
     # get pkgbase
@@ -148,7 +148,7 @@ prepare() {
     # set aur token
     curl -fs \
          -b "$COOKIE_FILE" \
-         "${AUR_URL_PKG_PAGE}${PKGBASE}${AUR_SETLANG}" \
+         "${AUR_URL_PKG_PAGE}${AUR_SETLANG}" \
          -o "${TEMPDIR}/token" || error "Unable to get ${PKGBASE} page"
     AUR_TOKEN=$(sed -n -e '/<input type="hidden" name="token"/ { s/.*value="\([0-9a-f]\+\)".*/\1/p;q }' "${TEMPDIR}/token")
     [[ ! "${AUR_TOKEN}" ]] && error "Unable to get token from AUR page"
