@@ -1,0 +1,283 @@
+#!/bin/bash
+#
+# cpaurball : Tool for submitting source tarballs to the AUR
+#
+# Copyright (C) 2015 Maxim Andersson <thesilentboatman@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+NAME='cpaurball'
+VERSION=1.0
+
+TEMPDIR=""
+AURBALL=""
+PROGRESSBAR=0
+CREATE_CONFIG=0
+CONFIGFILE=${XDG_CONFIG_HOME:-~/.config}/cpaurball
+USE_COLOR=""
+
+AUR_USERNAME=""
+AUR_PASSWORD=""
+AUR_URL="https://aur.archlinux.org"
+AUR_URL_LOGIN="$AUR_URL/login/"
+AUR_URL_SUBMIT="${AUR_URL}/submit"
+AUR_URL_PKG_INFO="$AUR_URL/rpc.php?type=info&arg="
+AUR_URL_PKG_PAGE="$AUR_URL/packages/"
+AUR_SETLANG="?setlang=en"
+AUR_TOKEN=""
+
+version() {
+    echo "$NAME $VERSION"
+}
+
+usage() {
+    echo "$NAME $VERSION"
+    echo
+    echo "Tool for submitting source tarballs to the AUR"
+    echo
+    echo "Usage: $0 [options]"
+    echo
+    echo "  -a, --aurball <file>   submits <file> (default: scans current dir)"
+    echo "  -c, --category <name>  sets category to <name> (default: uses the "
+    echo "                         category of the current uploaded aurball)"
+    echo "      --configure        store login credentials in config"
+    echo "  -h, --help             show this help message and exit"
+    echo "      --nocolor          disable colorized output messages"
+    echo "  -p, --password <pass>  logs in with <pass>"
+    echo "  -V, --version          show version and exit"
+    echo "  -u, --username <name>  logs in with <name>"
+    echo "  -#, --progressbar      show progressbar"
+    echo
+    echo "Examples:"
+    echo
+    echo "  mkaurball && cpaurball"
+    echo "  cpaurball --category \"newCategory\" --progressbar"
+    echo
+}
+
+set_color_output() {
+    # check if messages are to be printed using color
+    unset ALL_OFF BOLD BLUE GREEN RED YELLOW
+    if [[ -t 2 && $USE_COLOR != "n" ]]; then
+        # prefer terminal safe colored and bold text when tput is supported
+        if tput setaf 0 &>/dev/null; then
+            ALL_OFF="$(tput sgr0)"
+            BOLD="$(tput bold)"
+            BLUE="${BOLD}$(tput setaf 4)"
+            GREEN="${BOLD}$(tput setaf 2)"
+            RED="${BOLD}$(tput setaf 1)"
+            YELLOW="${BOLD}$(tput setaf 3)"
+        else
+            ALL_OFF="\e[0m"
+            BOLD="\e[1m"
+            BLUE="${BOLD}\e[34m"
+            GREEN="${BOLD}\e[32m"
+            RED="${BOLD}\e[31m"
+            YELLOW="${BOLD}\e[33m"
+        fi
+    fi
+    readonly ALL_OFF BOLD BLUE GREEN RED YELLOW
+}
+
+plain() {
+    printf "${BOLD}    ${*}${ALL_OFF}\n" >&2
+}
+
+msg() {
+    printf "${GREEN}==>${ALL_OFF}${BOLD} ${*}${ALL_OFF}\n" >&2
+}
+
+msg2() {
+    printf "${BLUE}  ->${ALL_OFF}${BOLD} ${*}${ALL_OFF}\n" >&2
+}
+
+warning() {
+    printf "${YELLOW}==> WARNING:${ALL_OFF}${BOLD} ${*}${ALL_OFF}\n" >&2
+}
+
+error() {
+    printf "${RED}==> ERROR:${ALL_OFF}${BOLD} ${*##Error - }${ALL_OFF}\n" >&2
+    exit 1
+}
+
+prepare() {
+    # get aurball
+    [[ ! "${AURBALL}" ]] && AURBALL=$(ls *.src.tar.gz 2>/dev/null | head -n1)
+    [[ ! "${AURBALL}" ]] && error "Unable to find aurball"
+    [[ ! -r "${AURBALL}" ]] && error "Unable to get read permission on aurball ${AURBALL}"
+
+    # get pkgbase
+    [[ "${AURBALL}" ]] && PKGBASE=$(tar -Oxzf "${AURBALL}" | grep "pkgbase = " | cut -d\  -f3)
+    [[ ! "${PKGBASE}" ]] && error "Unable to find pakage name"
+
+    # store cookie
+    msg "Retrieving cookie from the AUR..."
+
+    [[ ! "${AUR_USERNAME}" ]] && ask_for_username
+    [[ ! "${AUR_PASSWORD}" ]] && ask_for_password
+
+    curl -L \
+         -fs \
+         -c "$COOKIE_FILE" \
+         -d "user=${AUR_USERNAME}" \
+         --data-urlencode "passwd=${AUR_PASSWORD}" "$AUR_URL_LOGIN" \
+         -o "${TEMPDIR}/login" || error "Unable to access $AUR_URL_LOGIN"
+
+    local login_error="$(sed -ne 's/.*ul class="errorlist"><li>\([^<]*\)<.*/\1/p' ${TEMPDIR}/login)"
+    [[ ${login_error} ]] && error "${login_error}"
+
+    # get category id
+    if [[ ! "${CATEGORY_ID}" ]]; then
+        CATEGORY_ID=$(curl -fs "${AUR_URL_PKG_INFO}${PKGBASE}" | \
+            awk -F"[,:}]" '{for(i=1;i<=NF;i++){if($i~/'CategoryID'\042/){print $(i+1)}}}')
+        [[ "${CATEGORY_ID}" =~ ^[0-9]+$ ]] || ask_for_category
+    fi
+
+    # set aur token
+    curl -fs \
+         -b "$COOKIE_FILE" \
+         "${AUR_URL_PKG_PAGE}${PKGBASE}${AUR_SETLANG}" \
+         -o "${TEMPDIR}/token" || error "Unable to get ${PKGBASE} page"
+    AUR_TOKEN=$(sed -n -e '/<input type="hidden" name="token"/ { s/.*value="\([0-9a-f]\+\)".*/\1/p;q }' "${TEMPDIR}/token")
+    [[ ! "${AUR_TOKEN}" ]] && error "Unable to get token from AUR page"
+}
+
+submit() {
+    msg "Submitting aurball ${AURBALL}..."
+
+    # submit aurball
+    local arg="-s"
+    (( PROGRESSBAR )) && arg="-#"
+
+    curl ${arg} \
+         -f  \
+         -H 'Expect:' \
+         -b "$COOKIE_FILE" \
+         -F token="${AUR_TOKEN}" \
+         -F category=${CATEGORY_ID} \
+         -F pfile=@"${AURBALL}" \
+         -F pkgsubmit=1 \
+         ${AUR_URL_SUBMIT} \
+         -o ${TEMPDIR}/submit || error "Unable to access ${AUR_URL}"
+
+    # check if submit failed
+    local submit_error="$(sed -ne 's/.*ul class="errorlist"><li>\([^<]*\)<.*/\1/p' ${TEMPDIR}/submit)"
+    [[ ${submit_error} ]] && error "${submit_error}"
+
+    msg "Submission complete"
+}
+
+create_config() {
+    local answer configdir="${CONFIGFILE%/*}"
+
+    if [[ ! -d "${configdir}" ]]; then
+        mkdir -p "${configdir}" || error "Unable to create ${configdir}"
+    fi
+
+    if [[ -f "${CONFIGFILE}" ]]; then
+        read -p "${YELLOW}==> WARNING:${ALL_OFF}${BOLD} ${CONFIGFILE} exists. Replace ? [y/N] ${ALL_OFF}" answer
+        [[ "${answer}" != 'Y' && "${answer}" != 'y' ]] && exit 0
+    fi
+
+    echo -n > "${CONFIGFILE}"
+    if [[ ! -r "${CONFIGFILE}" ]]; then
+        error "Unable to create ${CONFIGFILE}"
+    fi
+
+    msg "Creation of ${CONFIGFILE}"
+    ask_for_username
+    printf "AUR_USERNAME=%q\n" "${AUR_USERNAME}" >> "${CONFIGFILE}"
+    ask_for_password
+    printf "AUR_PASSWORD=%q\n" "${AUR_PASSWORD}" >> "${CONFIGFILE}"
+    msg "Creation complete"
+
+    exit 0
+}
+
+ask_for_username() {
+    read -p "${BLUE}  ->${ALL_OFF}${BOLD} AUR User : ${ALL_OFF}" AUR_USERNAME
+}
+
+ask_for_password() {
+    read -p "${BLUE}  ->${ALL_OFF}${BOLD} AUR Password : ${ALL_OFF}" AUR_PASSWORD
+}
+
+ask_for_category() {
+    local answer
+    read -p "${BLUE}  ->${ALL_OFF}${BOLD} Package category (id or name) : ${ALL_OFF}" answer
+
+    set_category "${answer}"
+}
+
+set_category() {
+    case $1 in
+        2|daemons)     CATEGORY_ID=2;;
+        3|devel)       CATEGORY_ID=3;;
+        4|editors)     CATEGORY_ID=4;;
+        5|emulators)   CATEGORY_ID=5;;
+        6|games)       CATEGORY_ID=6;;
+        7|gnome)       CATEGORY_ID=7;;
+        8|i18n)        CATEGORY_ID=8;;
+        9|kde)         CATEGORY_ID=9;;
+        10|lib)        CATEGORY_ID=10;;
+        11|modules)    CATEGORY_ID=11;;
+        12|multimedia) CATEGORY_ID=12;;
+        13|network)    CATEGORY_ID=13;;
+        14|office)     CATEGORY_ID=14;;
+        15|science)    CATEGORY_ID=15;;
+        16|system)     CATEGORY_ID=16;;
+        17|x11)        CATEGORY_ID=17;;
+        18|xfce)       CATEGORY_ID=18;;
+        19|kernels)    CATEGORY_ID=19;;
+        20|fonts)      CATEGORY_ID=20;;
+        21|wayland)    CATEGORY_ID=21;;
+        *)             error "Coudn't identify category";;
+    esac
+}
+
+
+# ::: MAIN PROGRAM ::: #
+
+umask 077
+TEMPDIR=$(mktemp -dq --suffix=.cpaurball) || error "Failed to create temp dir"
+trap 'rm -rf "${TEMPDIR}"' EXIT
+
+COOKIE_FILE="${TEMPDIR}/cookies"
+
+[[ -r "$CONFIGFILE" ]] && source "$CONFIGFILE"
+
+while [[ $1 ]]; do
+    case $1 in
+        -h|--help)         usage; exit 0;;
+        -V|--version)      version; exit 0;;
+        --configure)    CREATE_CONFIG=1;;
+        -a|--aurball)      shift; AURBALL="$1";;
+        -u|--username)     shift; AUR_USERNAME="$1";;
+        -p|--password)     shift; AUR_PASSWORD="$1";;
+        -\#|--progressbar) PROGRESSBAR=1;; 
+        -c|--category)     shift; set_category "$1";;
+        --nocolor)      USE_COLOR='n';;
+        *)                 usage; exit 1;;
+    esac
+    shift
+done
+
+set_color_output
+(( CREATE_CONFIG )) && create_config
+
+prepare
+submit
+
+# vim:set ts=4 sw=4 et:
