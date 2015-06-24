@@ -1,3 +1,8 @@
+## [deprecated]
+
+Please note that this project is deprecated as of AUR4.
+<br><br>
+
 # cpaurball
 
 Tool for submitting source tarballs to the AUR.
